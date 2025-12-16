@@ -20,6 +20,9 @@
 #define BUFFER_SIZE 1024
 #define TIMESTAMP_INTERVAL 10
 
+#define USE_AESD_CHAR_DEVICE 1
+#define CHAR_DEVICE "/dev/aesdchar"
+
 static volatile sig_atomic_t g_signal_received = 0;
 static int g_server_fd = -1;
 
@@ -182,7 +185,9 @@ void cleanup(void)
         }
     }
     
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
+#endif
     
     // Destroy mutexes (safe even if not used)
     pthread_mutex_destroy(&g_file_mutex);
@@ -268,6 +273,29 @@ char *receive_packet(int sockfd)
  */
 int append_to_file(const char *data, size_t len)
 {
+#if USE_AESD_CHAR_DEVICE
+    pthread_mutex_lock(&g_file_mutex);
+    
+    int fd = open(CHAR_DEVICE, O_WRONLY);
+    if (fd < 0) {
+        syslog(LOG_ERR, "Failed to open %s for writing: %s", 
+               CHAR_DEVICE, strerror(errno));
+        pthread_mutex_unlock(&g_file_mutex);
+        return -1;
+    }
+    
+    ssize_t written = write(fd, data, len);
+    close(fd);
+    
+    pthread_mutex_unlock(&g_file_mutex);
+    
+    if (written != (ssize_t)len) {
+        syslog(LOG_ERR, "Failed to write complete data to %s", CHAR_DEVICE);
+        return -1;
+    }
+    
+    return 0;
+#else
     pthread_mutex_lock(&g_file_mutex);
     
     FILE *fp = fopen(DATA_FILE, "a");
@@ -289,6 +317,7 @@ int append_to_file(const char *data, size_t len)
     }
     
     return 0;
+#endif
 }
 
 /**
@@ -296,6 +325,61 @@ int append_to_file(const char *data, size_t len)
  */
 int send_file_contents(int sockfd)
 {
+#if USE_AESD_CHAR_DEVICE
+    pthread_mutex_lock(&g_file_mutex);
+    
+    int fd = open(CHAR_DEVICE, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            pthread_mutex_unlock(&g_file_mutex);
+            return 0;
+        }
+        syslog(LOG_ERR, "Failed to open %s for reading: %s", 
+               CHAR_DEVICE, strerror(errno));
+        pthread_mutex_unlock(&g_file_mutex);
+        return -1;
+    }
+    
+    // Read in chunks
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_read;
+    ssize_t total_sent = 0;
+    
+    while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+        if (g_signal_received) {
+            close(fd);
+            pthread_mutex_unlock(&g_file_mutex);
+            return -1;
+        }
+        
+        ssize_t bytes_sent = send(sockfd, buffer, bytes_read, 0);
+        if (bytes_sent < 0) {
+            if (errno == EINTR) {
+                if (g_signal_received) {
+                    close(fd);
+                    pthread_mutex_unlock(&g_file_mutex);
+                    return -1;
+                }
+                continue;
+            }
+            syslog(LOG_ERR, "send failed: %s", strerror(errno));
+            close(fd);
+            pthread_mutex_unlock(&g_file_mutex);
+            return -1;
+        }
+        total_sent += bytes_sent;
+    }
+    
+    close(fd);
+    pthread_mutex_unlock(&g_file_mutex);
+    
+    if (bytes_read < 0) {
+        syslog(LOG_ERR, "read failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    return 0;
+#else
     pthread_mutex_lock(&g_file_mutex);
     
     FILE *fp = fopen(DATA_FILE, "r");
@@ -377,6 +461,7 @@ int send_file_contents(int sockfd)
     
     free(file_buffer);
     return 0;
+#endif
 }
 
 /**
@@ -428,6 +513,7 @@ void *handle_client_thread(void *arg)
 /**
  * Thread function to write timestamp every 10 seconds
  */
+#if !USE_AESD_CHAR_DEVICE
 void *timestamp_thread(void *arg)
 {
     (void)arg;
@@ -460,6 +546,7 @@ void *timestamp_thread(void *arg)
     
     return NULL;
 }
+#endif
 
 /**
  * Daemonize the process
@@ -536,7 +623,9 @@ int main(int argc, char *argv[])
     openlog("aesdsocket", LOG_PID, LOG_USER);
     
     // Delete data file if it exists (start fresh)
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATA_FILE);
+#endif
     
     // Setup signal handlers
     setup_signal_handlers();
@@ -588,12 +677,14 @@ int main(int argc, char *argv[])
     }
     
     // Start timestamp thread
+#if !USE_AESD_CHAR_DEVICE
     pthread_t timestamp_tid;
     if (pthread_create(&timestamp_tid, NULL, timestamp_thread, NULL) != 0) {
         syslog(LOG_ERR, "Failed to create timestamp thread: %s", strerror(errno));
         cleanup();
         return -1;
     }
+#endif
     
     // Main loop: accept connections
     while (!g_signal_received) {
@@ -643,7 +734,9 @@ int main(int argc, char *argv[])
     }
     
     // Wait for timestamp thread to complete
+#if !USE_AESD_CHAR_DEVICE
     pthread_join(timestamp_tid, NULL);
+#endif
     
     // Cleanup (will join all client threads)
     cleanup();
